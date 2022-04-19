@@ -1,0 +1,50 @@
+
+RetrieveItemQuantityByProximityProcessor
+
+Request-->  SkuCode,IsMultiSkuListPresent,ZipCode,State,City,LocationSearchRange
+Response---> desc,DepQuantity,MultiSkuList
+
+
+Flow :-
+
+Step 1:- checks the zip got from the request is not empty they it is assigned to address object.
+         if it is not in address object we are assigned city and state 
+		if (StringUtils.isNotBlank(req.getZipCode()))
+			address.setZip(req.getZipCode());
+		else {
+			address.setCity(req.getCity());
+			address.setState(req.getState());
+		}
+		
+Step 2:-from headers we are checking ClientOrderInfo where it is blank are not.
+         if SkuCode is empty and IsMultiSkuListPresent  is true  and !ClientOrderInfo.equals(NOT_SET) && contains "ISPU"
+		 locationSearchRange =10 assinged 
+		 if not means we are taking the locationSearchRange value from the request.
+
+Step 3:- to find SkuLocationList we are calling storeServices..storeLocationByZip(address.getZip(), locSearchRange,D, 25, CacheOverride.PREFER_CACHED_VALUE);
+         if address class having zip code (check step1) else storeServices.storeLocationByCityState(address.getCity(),address.getState(), locSearchRange, D, 25,CacheOverride.PREFER_CACHED_VALUE);
+		  from SkuLocationList(object) we are retriving ListString locations.
+		  from this ListString locations connect to SIG gateway to determine SAP location based on SapEnabled condition.
+
+
+Step 4:- sapLocations.size() = 0  then we processSAP(req, header, locations, skuLocationList, sapLocations, locationSearchRange, address);
+
+                         1) first we are checking the SkuCode empty are not from the req if it is empty we are  process request for single item.
+						     method : -processSkuLocRequestSAP(req, locations, skuLocationList,itemQuantityByProximitySvcResponse, sapLocations);
+							 Description :-
+                             Location =0 
+							 first we are checking the requet loction size if it is zero we are setting desc and DepQuantity (SkuLocResponse  
+							 itemService.skuQuantityByProximity(skuLocRequest);)  to the response object.
+							 sapLocations.size()=0:-
+							 sapItemCall-->domainDataRetriever.getItemDetails(itemreq);===>ItemResponse--> Description  ---main response  set 
+							 mergeSAPCall--->getSkuqty---> response--DepQuantity .
+						 2) if it is blank then we are process request from the multiple item 
+						     method :- processMultiSkuLocRequestSAP(req, locations, skuLocationList,itemQuantityByProximitySvcResponse, sapLocations,locationSearchRange, address);
+                             
+							 
+							 processMultiSkuLocRequestSAP--->initializeTmpMultiSkuLocResp-->
+         
+		 sapLocations.size() !=0 then we processBAU(req, header);
+          
+		  
+		  now i need to start the 11 step can you please guide me the 11 step 
