@@ -1,0 +1,13 @@
+FIRLDS:
+RetrieveItemQuantityByProximityServiceRequest req)
+			throws POSWebserviceException {
+
+		if (req.getSkuCode() == null && !req.isIsMultiSkuListPresent())
+			throw new POSWebserviceException(
+					"skuCode is required for this Lookup");
+
+		if (StringUtils.isEmpty(req.getZipCode())
+				&& (StringUtils.isEmpty(req.getState()) && StringUtils
+						.isEmpty(req.getCity()))) {
+			throw new POSWebserviceException(
+					"Must have zipCode present or the combination of city and state present");
