@@ -1,0 +1,965 @@
+package vzw.pos.wsserver.rest.processors.inventoryLookup;
+
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
+import org.apache.commons.lang.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import vzw.pos.cache.annotations.types.CacheOverride;
+import vzw.pos.exception.POSException;
+import vzw.pos.mq.exceptions.MessageQueueException;
+import vzw.pos.mq.queues.ItemService;
+import vzw.pos.mq.queues.aceTim.MultiSkuLocRequest;
+import vzw.pos.mq.queues.aceTim.MultiSkuLocResponse;
+import vzw.pos.mq.queues.aceTim.SkuLocRequest;
+import vzw.pos.mq.queues.aceTim.SkuLocResponse;
+import vzw.pos.mq.queues.aceTim.SkuQtys;
+import vzw.pos.utilities.StringUtilities;
+import vzw.pos.wsclient.http.exceptions.POSHTTPException;
+import vzw.pos.wsclient.infomanager.generated.storeLocation.StoreLocationsResponse;
+import vzw.pos.wsclient.infomanager.interfaces.storeLocation.IStoreLocationsResponse;
+import vzw.pos.wsclient.infomanager.interfaces.storeLocation.IStoreTable;
+import vzw.pos.wsclient.infomanager.services.StoreServices;
+import vzw.pos.wsclient.posservicesws.generated.common.ClientOrderInfo;
+import vzw.pos.wsclient.posservicesws.generated.common.ServiceHeaderType;
+import vzw.pos.wsclient.posservicesws.generated.inventoryLookup.retrieveItemQuantityByProximity.MultiSkuListResponse;
+import vzw.pos.wsclient.posservicesws.generated.inventoryLookup.retrieveItemQuantityByProximity.RetrieveItemQuantityByProximityServiceRequest;
+import vzw.pos.wsclient.posservicesws.generated.inventoryLookup.retrieveItemQuantityByProximity.RetrieveItemQuantityByProximityServiceResponse;
+import vzw.pos.wsclient.posservicesws.generated.inventoryLookup.retrieveItemQuantityByProximity.SkuLocation;
+import vzw.pos.wsclient.posservicesws.generated.inventoryLookup.retrieveItemQuantityByProximity.SkuLocationList;
+import vzw.pos.wsclient.vip.VipServiceHeader;
+import vzw.pos.wsserver.common.Address;
+import vzw.pos.wsserver.domain.DomainDataRetriever;
+import vzw.pos.wsserver.domain.inventory.ItemInventory;
+import vzw.pos.wsserver.domain.inventory.ItemInventoryData;
+import vzw.pos.wsserver.domain.inventory.ItemInventoryRequest;
+import vzw.pos.wsserver.domain.inventory.ItemInventoryResponse;
+import vzw.pos.wsserver.domain.item.ItemRequest;
+import vzw.pos.wsserver.domain.item.ItemResponse;
+import vzw.pos.wsserver.exceptions.POSWebserviceException;
+import vzw.pos.wsserver.rest.processors.VipProcessor;
+import vzw.pos.wsserver.sap.delegate.SAPDelegator;
+import vzw.pos.wsserver.services.VipPropertyService;
+
+@Service
+public class RetrieveItemQuantityByProximityProcessor
+		implements
+		VipProcessorRetrieveItemQuantityByProximityServiceRequest, RetrieveItemQuantityByProximityServiceResponse {
+
+	private static final Logger logger = LoggerFactory
+			.getLogger(RetrieveItemQuantityByProximityProcessor.class);
+	private static final String DC_FOR_PROXIMITY_QTY = DC_FOR_PROXIMITY_QTY;
+
+	@Autowired
+	private ItemService itemService;
+
+	@Autowired
+	private StoreServices storeServices;
+
+	@Autowired
+	private SAPDelegator delegator;
+
+	@Autowired
+	private DomainDataRetriever domainDataRetriever;
+	
+	@Autowired
+	private VipPropertyService vipProperties;
+
+	@Override
+	public void validateRequest(
+			RetrieveItemQuantityByProximityServiceRequest req)
+			throws POSWebserviceException {
+
+		if (req.getSkuCode() == null && !req.isIsMultiSkuListPresent())
+			throw new POSWebserviceException(
+					skuCode is required for this Lookup);
+
+		if (StringUtils.isEmpty(req.getZipCode())
+				&& (StringUtils.isEmpty(req.getState()) && StringUtils
+						.isEmpty(req.getCity()))) {
+			throw new POSWebserviceException(
+					Must have zipCode present or the combination of city and state present);
+		}
+	}
+
+	@Override
+	public RetrieveItemQuantityByProximityServiceResponse processRequest(
+			RetrieveItemQuantityByProximityServiceRequest req,
+			VipServiceHeader header) throws POSWebserviceException {
+		RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse = new RetrieveItemQuantityByProximityServiceResponse();
+
+		 Determine what flow to execute processBAU or ProcessSAP from
+		
+		Address address = new Address();
+
+		if (StringUtils.isNotBlank(req.getZipCode()))
+			address.setZip(req.getZipCode());
+		else {
+			address.setCity(req.getCity());
+			address.setState(req.getState());
+		}
+
+		ServiceHeaderType h = (ServiceHeaderType) header;
+		ClientOrderInfo clientOrderInfo = h.getClientOrderInfo();
+		if (clientOrderInfo == null) {
+			logger.info(no client order info provided for this request);
+		}
+		
+		String locationSearchRange = (req.getLocationSearchRange() == null)0  req.getLocationSearchRange().toString();
+		if ((StringUtils.isBlank(req.getSkuCode())))
+		{
+			if (req.isIsMultiSkuListPresent()
+					&& ((clientOrderInfo != null && !NOT_SET
+							.equals(clientOrderInfo.getClientOrderType())) && clientOrderInfo
+							.getClientOrderType().contains(ISPU))
+					&& 0.equals(req.getLocationSearchRange().toString()))
+				locationSearchRange = 10;
+			else
+				locationSearchRange = req.getLocationSearchRange().toString();
+		}
+		
+		 retrieve store locations from infomanager service
+		SkuLocationList skuLocationList;
+		skuLocationList = SLDRetrieveStoreLocations(locationSearchRange, address);
+
+		 retrieve locations
+		ListSkuLocation skuLocation = skuLocationList.getSkuLocation();
+
+		ListString locations = retrieveLocations(skuLocation);
+		
+		 Populate sapskulocation from skulocation
+				ListString sapLocations = extractSAPLocations(locations);
+		
+		if (sapLocations.size()  0)
+		{	
+			logger.error(Executing SAP flow.);
+			return processSAP(req, header, locations, skuLocationList, sapLocations, locationSearchRange, address);
+		}
+		else
+		{
+			logger.error(Executing BAU flow.);
+			return processBAU(req, header);
+		}
+		
+	}
+	
+
+	public RetrieveItemQuantityByProximityServiceResponse processSAP(
+			RetrieveItemQuantityByProximityServiceRequest req,
+			VipServiceHeader header, ListString locations,
+			SkuLocationList skuLocationList, ListString sapLocations,
+			String locationSearchRange, Address address) throws POSWebserviceException {
+
+		RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse = new RetrieveItemQuantityByProximityServiceResponse();
+
+		ServiceHeaderType h = (ServiceHeaderType) header;
+		ClientOrderInfo clientOrderInfo = h.getClientOrderInfo();
+		if (clientOrderInfo == null) {
+			logger.info(no client order info provided for this request);
+		}
+
+		 process request for single item or multiple items
+		if (StringUtils.isNotBlank(req.getSkuCode()))
+			processSkuLocRequestSAP(req, locations, skuLocationList, 
+					itemQuantityByProximitySvcResponse, sapLocations);
+		else
+			processMultiSkuLocRequestSAP(req, locations, skuLocationList,
+					itemQuantityByProximitySvcResponse, sapLocations,locationSearchRange, address);
+
+		return itemQuantityByProximitySvcResponse;
+	}
+
+	
+	private void processSkuLocRequestSAP(
+			RetrieveItemQuantityByProximityServiceRequest req,
+			ListString locations,
+			SkuLocationList skuLocationList,
+			RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse, ListString sapLocations)
+			throws POSWebserviceException {
+
+		 common Place holder sku short description and DepQuantity
+		String skuShortDesc = ;
+		int depQnty = 0;
+		 retrieve locations
+		ListSkuLocation skuLocation = skuLocationList.getSkuLocation();
+       
+		 retrieve the quantity of skus at each BAU location and populate skuLocations Available quantities
+		if (locations.size()  0) {
+			logger.error(Executing BAU call in skulocReqSAP  );
+			SkuLocResponse skuLocResponse = singleSKUsapBAUCall(skuLocation, locations, req.getSkuCode());
+			skuShortDesc = skuLocResponse.getShortDesc();
+			itemQuantityByProximitySvcResponse.setSkuDescription(skuShortDesc);
+			depQnty = skuLocResponse.getDepQuantity();
+			itemQuantityByProximitySvcResponse.setQuantityInFulfillment(BigInteger
+					.valueOf((long)skuLocResponse.getDepQuantity()));
+		}
+		
+		 retrieve the quantities of skus from each SAPenabledlocations 
+		
+		if (sapLocations.size()  0)
+		{
+			logger.error(Executing sap-AtP chk call in skulocReqSAP  );
+			if(itemQuantityByProximitySvcResponse.getSkuDescription() == null)
+			{ 
+				ListString skulist = new ArrayListString();
+				skulist.add(req.getSkuCode());
+				skuShortDesc = sapItemCall(skulist).get(0);
+				itemQuantityByProximitySvcResponse.setSkuDescription(skuShortDesc);
+			}
+			 Make SAPInventoryOMQ request.  
+			ListString skuCodeLst = new ArrayListString();
+			skuCodeLst.add(req.getSkuCode());
+			ItemInventoryResponse iteminvresp = sapInventoryCall(sapLocations, skuCodeLst,L);
+ 			
+			update skuLocationList from SAP ATG inv call 
+			singleSKUsapPopulateSkuLocations(iteminvresp, skuLocation, sapLocations,itemQuantityByProximitySvcResponse);
+		    
+		}
+		
+		itemQuantityByProximitySvcResponse.setSkuLocationList(skuLocationList);
+	}
+	private void singleSKUsapPopulateSkuLocations(ItemInventoryResponse iteminvresp, ListSkuLocation skuLocationLst,
+			ListString sapLocations, RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse)
+			throws POSWebserviceException
+			
+	{
+		if(itemQuantityByProximitySvcResponse.getQuantityInFulfillment() == null) {
+			itemQuantityByProximitySvcResponse.setQuantityInFulfillment(BigInteger
+			.valueOf((long)0));
+		}
+		
+		try {
+				String locCode;
+				ListItemInventory itemInvLst = iteminvresp.getItemInventoryDetails();
+				
+				if(itemInvLst.isEmpty() ) {
+					throw new POSWebserviceException(Failed to retrieve response from SIG SAP inventory call);
+				}
+				
+				for(ItemInventory itemInv  itemInvLst)
+				{
+					locCode = itemInv.getLocation();
+					if (isDCLocation(locCode))  qnty value goes into qntyinfulfillment of the response xml
+					{
+						if(itemQuantityByProximitySvcResponse.getQuantityInFulfillment().longValue() == 0l )
+						{itemQuantityByProximitySvcResponse.setQuantityInFulfillment(BigInteger
+						.valueOf((long)itemInv.getAvailableQty()));
+						}
+						continue;
+					}
+					for (SkuLocation skuLocation  skuLocationLst)
+					{
+						if (skuLocation.getLocationCode()
+								.replace(-, ).equals(locCode)) 
+						{
+							skuLocation.setQuantityAvailable(
+									BigInteger.valueOf((long)itemInv.getAvailableQty()));
+							if (itemInv.getAvailableQty()==0)
+								skuLocation.setQuantityAvailable(BigInteger.valueOf(0));
+										
+							break;
+						}
+					}
+				}
+			
+			} catch (POSException p) {
+				logger.error(Failed to retrieve Item quantity , p);
+				String msg = Failed to retrieve Item quantity - SIG failure.;
+				if(skuLocationLst.size() == sapLocations.size() && p.getCause() instanceof POSHTTPException) {  if No VIIA locations then throw
+					msg = Communication failure with Inventory System;
+					throw new POSWebserviceException(msg);
+				} else if (!(p.getCause() instanceof POSHTTPException)) {
+					throw new POSWebserviceException(msg);
+				}
+			}
+	}
+	
+	private boolean isDCLocation(String locationCode) {
+		return StringUtilities.safeContains(vipProperties.getStringProperty(DC_FOR_PROXIMITY_QTY),locationCode);
+	}
+	private SkuLocResponse singleSKUsapBAUCall(ListSkuLocation skuLocation, ListString locations, String skuCode)
+	  throws POSWebserviceException
+	{
+		 populate BAUomq request
+				SkuLocRequest skuLocRequest = new SkuLocRequest();
+				skuLocRequest.setLocs(locations);
+				skuLocRequest.setSku(skuCode);
+
+				SkuLocResponse skuLocResponse = new SkuLocResponse();
+				
+					try {
+							skuLocResponse = itemService
+									.skuQuantityByProximity(skuLocRequest);
+						} catch (MessageQueueException mq) {
+							throw new POSWebserviceException(mq.getDisplayMessage());
+						} catch (POSException e) {
+							logger.error(Error with retrieve single sku quantity,
+									e.getMessage());
+							throw new POSWebserviceException(
+									Error with retrieve single sku quantity);
+						}
+					 update skuLocationList from response
+					String loccode = ;
+					for (int i = 0; i  locations.size(); ++i) {
+						loccode = locations.get(i);
+						for (int j = 0; j  skuLocation.size(); ++j) {
+
+							if (skuLocation.get(j).getLocationCode().replace(-, )
+									.equals(loccode)) {
+								skuLocation.get(j).setQuantityAvailable(
+										BigInteger.valueOf(skuLocResponse
+												.getLocQuantity().get(i)));
+								break;
+							}
+						}
+					}
+			return skuLocResponse;
+	}
+
+	private ListString extractSAPLocations(ListString locations) throws POSWebserviceException {
+		 connect to SIG gateway to determine SAP location
+		
+		ListString saplocations = new ArrayListString();
+		try {
+			for (IteratorString iterator = locations.iterator(); iterator
+					.hasNext();) {
+				boolean sapEnabled = false;
+				
+				
+				String locationCode = iterator.next();
+				 determine if location SAP enabled or not modify
+				if (delegator.isSapEnabled(locationCode) )
+
+					sapEnabled = true;
+
+				if (sapEnabled == true) {
+					saplocations.add(locationCode);
+					iterator.remove();
+				}
+				
+			}
+		} catch (Exception p) {
+			logger.error(Call to delegator to determine SAPLocation failed .
+					+ p.getMessage());
+			throw new POSWebserviceException(
+					Error while determining if location is SAPEnabled);
+		}
+		return saplocations;
+	}
+
+	private ListString sapItemCall(ListString skuList)
+			throws POSWebserviceException {
+
+		 call SAPItem omq for getting ShortDescription of SKU codes
+		ListString skuShortDescList = null;
+		try {
+			ItemRequest itemreq = new ItemRequest();
+			itemreq.setSkuList(skuList);
+
+			ItemResponse itemresp = domainDataRetriever.getItemDetails(itemreq);
+			skuShortDescList = new ArrayListString();
+			for (int i = 0; i  skuList.size(); ++i) {
+				skuShortDescList.add(itemresp.getItemDetails().get(i)
+						.getShortDescription());
+			}
+		} catch (POSException p) {
+			logger.error(Call to SAP to retrieve Item Short Description failed .
+					+ p.getMessage());
+			throw new POSWebserviceException(
+					Error while retrievieng Item Short description);
+
+		}
+		return skuShortDescList;
+
+	}
+
+	private ItemInventoryResponse sapInventoryCall(ListString sapLocations,
+			ListString skuCodeLst, String storeSaleIndicator) throws POSWebserviceException {
+
+		 Create SAPOMQRequest Data
+
+		ItemInventoryRequest iteminvreq = new ItemInventoryRequest();
+
+		ListItemInventoryData inventoryData = new ArrayListItemInventoryData();
+      
+		ItemInventoryData iteminvdata = null;
+		
+		for(String skuCode  skuCodeLst)
+		{
+			for (String saplocation  sapLocations) {
+				
+				iteminvdata = new ItemInventoryData();
+				iteminvdata.setSku(skuCode);
+				iteminvdata.setFulfLocalInd('D');
+				
+				iteminvdata.setStoreSaleIndicator(storeSaleIndicator);
+				iteminvdata.setDeplLoc(saplocation);
+				inventoryData.add(iteminvdata);
+				
+			}
+			 Add a iteminvdata to get wareHouse quantity
+			
+			iteminvdata = new ItemInventoryData();
+			iteminvdata.setSku(skuCode);
+			iteminvdata.setFulfLocalInd('D');
+			iteminvdata.setStoreSaleIndicator(F);
+			iteminvdata.setDeplLoc(sapLocations.get(0));
+			inventoryData.add(iteminvdata);
+		}
+			iteminvreq.setInventoryData(inventoryData);
+			ItemInventoryResponse iteminvresp = domainDataRetriever
+					.getItemInventoryDetails(iteminvreq);
+		
+		return iteminvresp;
+	}
+	
+	
+	private void processMultiSkuLocRequestSAP(
+			RetrieveItemQuantityByProximityServiceRequest req,
+			ListString locations,
+			SkuLocationList skuLocationList,
+			RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse, ListString sapLocations,
+			String locationSearchRange, Address address)
+			throws POSWebserviceException {
+
+		ListSkuLocation skuLocation = skuLocationList.getSkuLocation();
+		
+		  multiSkuLocResponse holderobject to combine
+		 results from BA_OMQ and SAPOMQ
+
+		TmpMultiSkuLocResponse tmpMultiSkuLocResp = new TmpMultiSkuLocResponse();
+
+		initializeTmpMultiSkuLocResp(req.getMultiSkuList().getSkuCount(),
+				skuLocation.size(), tmpMultiSkuLocResp);
+		
+		 Populate request for multiple items -- BAU OMQ call
+		
+		ListString skuList = new ArrayListString();
+		skuList = req.getMultiSkuList().getSkuCode();
+		
+	
+		if (locations.size()  0)   Make BAU OMQ call
+		{
+			logger.error(Executing BAU call in multiskulocReqSAP  );
+			MultiSkuLocResponse multiSkuLocResponse = multiSKUsapBAUCall(skuList, locations);
+			
+			 Copy multiSkuLocResponse into tmpmultiSkuLocResponse object
+			mergeBauOMQ(multiSkuLocResponse, tmpMultiSkuLocResp, locations,
+					skuLocation);
+		}
+		if (sapLocations.size()  0)   Make SAP-ATP call
+		{
+			logger.error(Executing sap-atp chk call in multskulocReqSAP  );
+			 Get SkuShortDesc and populate tmpmultiSkuLocResp - sapItem call
+			ListString skushortDesc = sapItemCall(skuList);
+			
+			for(int i =0; i  tmpMultiSkuLocResp.getTmpskuqnty().size(); ++i)
+			{
+				tmpMultiSkuLocResp.getTmpskuqnty().get(i).setShortDesc(skushortDesc.get(i));
+			}
+			
+			 SAP-SIG inventory call
+			ItemInventoryResponse itemInvResp = null;
+			try	{
+				  itemInvResp = sapInventoryCall(sapLocations, skuList,L);
+			 	  ListItemInventory itmInv = itemInvResp.getItemInventoryDetails();
+			 	   Add results into tmpMultiSkuLocResp
+			 	  mergeSAPCall(tmpMultiSkuLocResp.getTmpskuqnty(), skuLocation, itmInv, skuList);
+				} catch (POSException p) {
+					logger.error(Failed to retrieve qunatity for the item for multiSkuSap call.
+							+ p);
+					String msg = Failed to retrieve qunatity for the item ;
+					if(locations.isEmpty() && p.getCause() instanceof POSHTTPException) { Only throw if no VIIA location found.
+						msg = Communication failure with Inventory System;
+						throw new POSWebserviceException(msg);
+					} else if (!(p.getCause() instanceof POSHTTPException)) {
+						throw new POSWebserviceException(msg);
+					}
+				}
+		}
+		populateMultiSkuLocResponseSAP(itemQuantityByProximitySvcResponse,
+				tmpMultiSkuLocResp, req, skuLocationList, locationSearchRange, address);
+	}
+	
+	private void mergeSAPCall( ListTmpSkuQnty TmpSkuQtyLst, ListSkuLocation skuLocation,
+			ListItemInventory itmInvLst, ListString skuLst) 
+	{
+		TmpSkuQnty skuqty = null;
+		
+		for (int j = 0; j  itmInvLst.size(); ++j)
+		{
+			ItemInventory itmInv = itmInvLst.get(j);
+			skuqty = getSkuqty(TmpSkuQtyLst, skuLst, itmInv.getSku()); determine skuqty to update
+			 
+			for (int k = 0; k  skuLocation.size(); ++k)
+			{
+				SkuLocation skuLoc = skuLocation.get(k);
+				Set Wharehousefulfillment Qnty
+				String locCode = itmInv.getLocation();
+				if (isDCLocation(locCode))  qnty value goes into qntyinfulfillment of the response xml
+				{
+					skuqty.setDepQuantity(itmInv.getAvailableQty());
+					break;
+				}
+				
+				if (itmInv.getLocation().equals(skuLoc.getLocationCode().replace(-, )))
+				{
+					skuqty.getLocQuantity().set(k,(int)Math.round(itmInv.getAvailableQty()  0.4));
+					skuqty.getLocQuantity().set(k,itmInv.getAvailableQty() );
+					break;
+				}
+			}
+		}
+	}
+	private TmpSkuQnty getSkuqty(ListTmpSkuQnty tmpSkuQtyLst, ListStringskuLst, String itminvSku)
+	{
+		int TmpSkyQntyIndex  = skuLst.indexOf(itminvSku);
+		
+		TmpSkuQnty skuQty = tmpSkuQtyLst.get(TmpSkyQntyIndex);
+		return skuQty;
+		
+	}
+	private MultiSkuLocResponse multiSKUsapBAUCall(ListString skuList, ListString locations)
+			throws  POSWebserviceException
+	{
+		
+		MultiSkuLocRequest multiSkuLocRequest = new MultiSkuLocRequest();
+		multiSkuLocRequest.getSkuList().addAll(skuList);
+
+		multiSkuLocRequest.getLocationList().addAll(locations);
+		MultiSkuLocResponse multiSkuLocResponse = null;
+		try {
+			multiSkuLocResponse = itemService
+					.multiSkuQuantityByProximity(multiSkuLocRequest);
+		} catch (MessageQueueException mq) {
+			throw new POSWebserviceException(mq);
+		} catch (POSException e) {
+			logger.error(Error with retrieving multipule sku quantity - multiSKUsapBAUCall,
+					e.getMessage());
+			throw new POSWebserviceException(e);
+		}
+		return multiSkuLocResponse;
+	}
+	private void populateMultiSkuLocResponseSAP(
+			RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse,
+			TmpMultiSkuLocResponse tmpMultiSkuLocResponse,
+			RetrieveItemQuantityByProximityServiceRequest req,
+			SkuLocationList skuLocationList, String locationSearchRange, Address address) throws POSWebserviceException {
+
+		ListMultiSkuListResponse multiSkuList = itemQuantityByProximitySvcResponse
+				.getMultiSkuList();
+		ListSkuLocation skuLocations = skuLocationList.getSkuLocation();
+		ListTmpSkuQnty skuQtys = tmpMultiSkuLocResponse.getTmpskuqnty();
+		ListString skuCodes = req.getMultiSkuList().getSkuCode();
+
+		logger.info(skuLocations size {}, skuLocations.size());
+		
+		for (String skuCode  skuCodes) {
+			MultiSkuListResponse multiSkuListResp = new MultiSkuListResponse();
+			multiSkuListResp.setSkuCode(skuCode);
+			multiSkuListResp.setSkuLocationList(objectCloner(skuLocationList,locationSearchRange, address ));
+			multiSkuListResp.setSkuLocationList(SLDRetrieveStoreLocations(locationSearchRange, address));
+			multiSkuList.add(multiSkuListResp);
+			
+		}
+        logger.info(multiskuList size {}, multiSkuList.size());
+		TmpSkuQnty skuQty = null; MultiSkuListResponse mklResponse = null;
+		for (int i = 0; i  multiSkuList.size(); i++) {
+			skuQty = skuQtys.get(i);
+			mklResponse = multiSkuList.get(i);
+			mklResponse.setSkuDescription(skuQty.getShortDesc());
+			mklResponse.setQuantityInFulfillment(BigInteger.valueOf(skuQty.getDepQuantity()));
+			Integer locQuantity = null; SkuLocation skuLocation = null;
+			
+			for (int j = 0; j  mklResponse.getSkuLocationList()
+					.getSkuLocation().size(); j++) 
+			{
+				 locQuantity = skuQty.getLocQuantity().get(j);
+				 skuLocation = mklResponse.getSkuLocationList()
+						.getSkuLocation().get(j);
+				skuLocation.setQuantityAvailable(new BigInteger(locQuantity.toString()));
+				logger.info(quantity available {},
+						skuLocation.getQuantityAvailable());
+			}
+
+			logger.debug(multiSkuList skuDescpt - {}, quanInFulFil - {},
+					multiSkuList.get(i).getSkuDescription(), multiSkuList
+							.get(i).getQuantityInFulfillment());
+		}
+	}
+	private void initializeTmpMultiSkuLocResp(int skuListsize,
+			int locationListSize, TmpMultiSkuLocResponse tmpMultiSkuLocResponse) {
+		 Add records for each sku. For each SKU add location List
+		for (int i = 0; i  skuListsize; ++i) {
+			TmpSkuQnty tmpSkuQnty = new TmpSkuQnty();
+
+			for (int j = 0; j  locationListSize; ++j) {
+				tmpSkuQnty.getLocQuantity().add(0);
+			}
+			tmpMultiSkuLocResponse.getTmpskuqnty().add(tmpSkuQnty);
+		}
+
+	}
+
+	private void mergeBauOMQ(MultiSkuLocResponse multiSkuLocResponse,
+			TmpMultiSkuLocResponse tmpmultiSkuLocResp, ListString locations,
+			ListSkuLocation skuLocation) {
+
+		ListTmpSkuQnty tmpskuqtys = tmpmultiSkuLocResp.getTmpskuqnty();
+		ListSkuQtys skuqtys = multiSkuLocResponse.getSkuQtys();
+		for (int i = 0; i  locations.size(); ++i)  loc for bauomq only
+		{
+			for (int j = 0; j  skuLocation.size(); ++j)  all loc
+			{
+				if (skuLocation.get(j).getLocationCode().replace(-, )
+						.equals(locations.get(i))) {
+					for (int k = 0; k  skuqtys.size(); ++k) {  copy qunatity
+																 value,
+																 skushortdesc,depQuantity
+						tmpskuqtys.get(k).getLocQuantity()
+								.set(j, skuqtys.get(k).getLocQuantity().get(i));
+						tmpskuqtys.get(k).setDepQuantity(
+								skuqtys.get(k).getDepQuantity());
+						tmpskuqtys.get(k).setShortDesc(
+								skuqtys.get(k).getShortDesc());
+					}
+					break;
+				}
+			}
+		}
+	}
+
+	private class TmpMultiSkuLocResponse {
+		ListTmpSkuQnty TmpSkuQnty;
+
+		public TmpMultiSkuLocResponse() {
+			this.TmpSkuQnty = new ArrayListTmpSkuQnty();
+		}
+
+		public ListTmpSkuQnty getTmpskuqnty() {
+			return TmpSkuQnty;
+		}
+
+		public void setTmpskuqnty(ListTmpSkuQnty tmpskuqnty) {
+			TmpSkuQnty = tmpskuqnty;
+		}
+
+	}
+
+	private class TmpSkuQnty {
+
+		String shortDesc;
+		int depQuantity;
+		int altDepQuantity;
+		ListInteger locQuantity;
+
+		public TmpSkuQnty() {
+			this.locQuantity = new ArrayListInteger();
+			this.shortDesc = ;
+			this.altDepQuantity = 0;
+		}
+
+		public String getShortDesc() {
+			return shortDesc;
+		}
+
+		public void setShortDesc(String shortDesc) {
+			this.shortDesc = shortDesc;
+		}
+
+		public int getDepQuantity() {
+			return depQuantity;
+		}
+
+		public void setDepQuantity(int depQuantity) {
+			this.depQuantity = depQuantity;
+		}
+
+		public int getAltDepQuantity() {
+			return altDepQuantity;
+		}
+
+		public void setAltDepQuantity(int altDepQuantity) {
+			this.altDepQuantity = altDepQuantity;
+		}
+
+		public ListInteger getLocQuantity() {
+			return locQuantity;
+		}
+
+		public void setLocQuantity(ListInteger locQuantity) {
+			this.locQuantity = locQuantity;
+		}
+	}
+
+	public RetrieveItemQuantityByProximityServiceResponse processBAU(
+			RetrieveItemQuantityByProximityServiceRequest req,
+			VipServiceHeader header) throws POSWebserviceException {
+
+		RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse = new RetrieveItemQuantityByProximityServiceResponse();
+
+		Address address = new Address();
+
+		if (StringUtils.isNotBlank(req.getZipCode()))
+			address.setZip(req.getZipCode());
+		else {
+			address.setCity(req.getCity());
+			address.setState(req.getState());
+		}
+
+		ServiceHeaderType h = (ServiceHeaderType) header;
+		ClientOrderInfo clientOrderInfo = h.getClientOrderInfo();
+		if (clientOrderInfo == null) {
+			logger.info(no client order info provided for this request);
+		}
+
+		 process request for single item or multiple items
+		if (StringUtils.isNotBlank(req.getSkuCode()))
+			processSkuLocRequest(req, address, clientOrderInfo,
+					itemQuantityByProximitySvcResponse);
+		else
+			processMultiSkuLocRequest(req, address, clientOrderInfo,
+					itemQuantityByProximitySvcResponse);
+
+		return itemQuantityByProximitySvcResponse;
+	}
+
+	private void processMultiSkuLocRequest(
+			RetrieveItemQuantityByProximityServiceRequest req,
+			Address address,
+			ClientOrderInfo clientOrderInfo,
+			RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse)
+			throws POSWebserviceException {
+
+		String locationSearchRange;
+
+		 Retrieve SLDB Store Locations
+		if (req.isIsMultiSkuListPresent()
+				&& ((clientOrderInfo != null && !NOT_SET
+						.equals(clientOrderInfo.getClientOrderType())) && clientOrderInfo
+						.getClientOrderType().contains(ISPU))
+				&& 0.equals(req.getLocationSearchRange().toString()))
+			locationSearchRange = 10;
+		else
+			locationSearchRange = req.getLocationSearchRange().toString();
+
+		SkuLocationList skuLocationList = SLDRetrieveStoreLocations(
+				locationSearchRange, address);
+
+		 Populate request for multiple items
+		MultiSkuLocRequest multiSkuLocRequest = new MultiSkuLocRequest();
+		ListString skuList = new ArrayListString();
+		skuList = req.getMultiSkuList().getSkuCode();
+		multiSkuLocRequest.getSkuList().addAll(skuList);
+
+		 retrieve store locations from SLDB service response and populate in
+		 omq call
+		ListSkuLocation skuLocation = skuLocationList.getSkuLocation();
+		ListString locations = retrieveLocations(skuLocation);
+		multiSkuLocRequest.getLocationList().addAll(locations);
+
+		MultiSkuLocResponse multiSkuLocResponse = new MultiSkuLocResponse();
+
+		 retrieve the quantity the of items that are at each location
+		try {
+			multiSkuLocResponse = itemService
+					.multiSkuQuantityByProximity(multiSkuLocRequest);
+		} catch (MessageQueueException mq) {
+			throw new POSWebserviceException(mq);
+		} catch (POSException e) {
+			logger.error(Error with retrieving multipule sku quantity,
+					e.getMessage());
+			throw new POSWebserviceException(Error with retrieving multipule sku quantity);
+		}
+
+		 populate response
+		populateMultiSkuLocResponse(itemQuantityByProximitySvcResponse,
+				multiSkuLocResponse, req, skuLocationList, clientOrderInfo);
+
+	}
+
+	private void populateMultiSkuLocResponse(
+			RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse,
+			MultiSkuLocResponse multiSkuLocResponse,
+			RetrieveItemQuantityByProximityServiceRequest req,
+			SkuLocationList skuLocationList, ClientOrderInfo clientOrderInfo)
+			throws POSWebserviceException {
+
+		ListMultiSkuListResponse multiSkuList = itemQuantityByProximitySvcResponse
+				.getMultiSkuList();
+		ListSkuLocation skuLocations = skuLocationList.getSkuLocation();
+		ListSkuQtys skuQtys = multiSkuLocResponse.getSkuQtys();
+		ListString skuCodes = req.getMultiSkuList().getSkuCode();
+
+		logger.info(skuLocations size {}, skuLocations.size());
+		 logger.info(skuLocations {}, new Object[]{skuLocations});
+
+		for (String skuCode  skuCodes) {
+			MultiSkuListResponse multiSkuListResp = new MultiSkuListResponse();
+			multiSkuListResp.setSkuCode(skuCode);
+			multiSkuListResp.setSkuLocationList(skuLocationList);
+			multiSkuList.add(multiSkuListResp);
+		}
+
+		logger.info(multiskuList size {}, multiSkuList.size());
+
+		for (int i = 0; i  multiSkuList.size(); i++) {
+			SkuQtys skuQty = skuQtys.get(i);
+			MultiSkuListResponse mklResponse = multiSkuList.get(i);
+
+			mklResponse.setSkuDescription(skuQty.getShortDesc());
+			mklResponse.setQuantityInFulfillment(BigInteger.valueOf((long)skuQty
+					.getDepQuantity()));
+
+			for (int j = 0; j  mklResponse.getSkuLocationList()
+					.getSkuLocation().size(); j++) {
+
+				Integer locQuantity = skuQty.getLocQuantity().get(i);
+				SkuLocation skuLocation = mklResponse.getSkuLocationList()
+						.getSkuLocation().get(j);
+				skuLocation.setQuantityAvailable(new BigInteger(locQuantity
+						.toString()));
+				logger.info(quantity available {},
+						skuLocation.getQuantityAvailable());
+			}
+
+			logger.debug(multiSkuList skuDescpt - {}, quanInFulFil - {},
+					multiSkuList.get(i).getSkuDescription(), multiSkuList
+							.get(i).getQuantityInFulfillment());
+		}
+	}
+
+	private void processSkuLocRequest(
+			RetrieveItemQuantityByProximityServiceRequest req,
+			Address address,
+			ClientOrderInfo clientOrderInfo,
+			RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse)
+			throws POSWebserviceException {
+
+		 retrieve store locations from infomanager service
+		SkuLocationList skuLocationList;
+		skuLocationList = SLDRetrieveStoreLocations(req
+				.getLocationSearchRange().toString(), address);
+
+		 retrieve sku codes from API request
+		SkuLocRequest skuLocRequest = new SkuLocRequest();
+		skuLocRequest.setSku(req.getSkuCode());
+
+		 retrieve locations and add them to omq request
+		ListSkuLocation skuLocation = skuLocationList.getSkuLocation();
+		ListString locations = retrieveLocations(skuLocation);
+		skuLocRequest.setLocs(locations);
+
+		SkuLocResponse skuLocResponse = new SkuLocResponse();
+
+		 retieve the quantity of skus at each location
+		try {
+			skuLocResponse = itemService.skuQuantityByProximity(skuLocRequest);
+		} catch (MessageQueueException mq) {
+			throw new POSWebserviceException(mq.getDisplayMessage());
+		} catch (POSException e) {
+			logger.error(Error with retrieve single sku quantity,
+					e.getMessage());
+			throw new POSWebserviceException(Error with retrieving single sku quantity);
+		}
+
+		 populate response
+		populateSkuLocationResponse(skuLocationList,
+				itemQuantityByProximitySvcResponse, skuLocResponse);
+	}
+
+	private ListString retrieveLocations(ListSkuLocation skuLocation) {
+		ListString locations = new ArrayListString();
+        StringBuilder sb =new StringBuilder( );
+		for (SkuLocation location  skuLocation) {
+			sb.append(location.getLocationCode() +   );
+			locations.add(location.getLocationCode().replace(-, ));
+
+		}
+		logger.info(location from SLDB Call + sb.toString());
+				
+		return locations;
+	}
+
+	private void populateSkuLocationResponse(
+			SkuLocationList skuLocationList,
+			RetrieveItemQuantityByProximityServiceResponse itemQuantityByProximitySvcResponse,
+			SkuLocResponse skuLocResponse) throws POSWebserviceException {
+
+		for (int i = 0; i  skuLocationList.getSkuLocation().size(); i++) {
+			SkuLocation skuLocation = skuLocationList.getSkuLocation().get(i);
+			logger.debug(quantityAvailable {}, skuLocResponse
+					.getLocQuantity().get(i));
+			skuLocation.setQuantityAvailable(BigInteger.valueOf((long)skuLocResponse
+					.getLocQuantity().get(i)));
+		}
+
+		itemQuantityByProximitySvcResponse.setSkuLocationList(skuLocationList);
+		itemQuantityByProximitySvcResponse.setSkuDescription(skuLocResponse
+				.getShortDesc());
+		itemQuantityByProximitySvcResponse.setQuantityInFulfillment(BigInteger
+				.valueOf((long)skuLocResponse.getDepQuantity()));
+	}
+
+	private SkuLocationList SLDRetrieveStoreLocations(String locSearchRange,
+			Address address) throws POSWebserviceException {
+
+		IStoreLocationsResponse storeLocations = null;
+		SkuLocationList skuLocationList = new SkuLocationList();
+		String locationCode = ;
+
+		 service to retrieve store location information
+		try {
+			if (StringUtils.isNotBlank(address.getZip()))
+				storeLocations = (StoreLocationsResponse) storeServices
+						.storeLocationByZip(address.getZip(), locSearchRange,
+								D, 25, CacheOverride.PREFER_CACHED_VALUE);
+			else
+				storeLocations = (StoreLocationsResponse) storeServices
+						.storeLocationByCityState(address.getCity(),
+								address.getState(), locSearchRange, D, 25,
+								CacheOverride.PREFER_CACHED_VALUE);
+		} catch (POSException e) {
+			 framework logs exception
+		}
+
+		if (storeLocations != null) {
+
+			if (storeLocations.getTable() != null) {
+
+				for (IStoreTable storeTable  storeLocations.getTable()) {
+
+					SkuLocation skuLocation = new SkuLocation();
+					skuLocation.setCity(storeTable.getCITY());
+					skuLocation.setState(storeTable.getSTATE());
+					skuLocation.setZipCode(storeTable.getZIP());
+					if (StringUtils.isEmpty(storeTable.getZIPPLUS()))
+						skuLocation.setZipCode4();
+					else
+						skuLocation.setZipCode4(storeTable.getZIPPLUS());
+					skuLocation.setStoreAddressLine1(storeTable.getADDRESS1());
+					skuLocation.setStoreAddressLine2(StringUtilities
+							.formatString(storeTable.getADDRESS2(), ));
+					skuLocation.setStoreName(StringUtilities.formatString(
+							storeTable.getSTORENAME(), ).replace(', ));
+					skuLocation.setStorePhone(storeTable.getPHONENUMBER());
+					skuLocation.setStoreID(storeTable.getRETAILID());
+					locationCode = storeTable.getNETACELOCATIONCODE();
+					skuLocation.setLocationCode(locationCode);
+					skuLocation.setDistance(new BigDecimal(storeTable
+							.getDISTANCE()));
+					skuLocationList.getSkuLocation().add(skuLocation);
+				}
+			}
+		}
+
+		return skuLocationList;
+	}
+}
