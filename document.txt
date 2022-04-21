@@ -42,9 +42,70 @@ Step 4:- sapLocations.size() = 0  then we processSAP(req, header, locations, sku
 						     method :- processMultiSkuLocRequestSAP(req, locations, skuLocationList,itemQuantityByProximitySvcResponse, sapLocations,locationSearchRange, address);
                              
 							 
-							 processMultiSkuLocRequestSAP--->initializeTmpMultiSkuLocResp-->
-         
-		 sapLocations.size() !=0 then we processBAU(req, header);
+							 processMultiSkuLocRequestSAP---> The Method Starts from that process
+							 
+							 initializeTmpMultiSkuLocResp-->Add records for each sku. For each SKU add location List
+							 
+            Step:1 -> if (locations.size()  0)   Make BAU OMQ call ---> Its having the one condition to get BAU Call
+							 
+							 //Copy multiSkuLocResponse into tmpmultiSkuLocResponse object
+							 
+							 //Here its the service call
+							 
+							 multiSkuLocResponse = itemService.multiSkuQuantityByProximity(multiSkuLocRequest); 
+							 
+            Step:2 -> if (sapLocations.size()  0)   Make SAP-ATP call ---> Its having the another condition to get SAP-ATP Call
+							 
+							 //	Get SkuShortDesc and populate tmpmultiSkuLocResp - sapItem call
+							 
+							 //call SAPItem omq for getting ShortDescription of SKU codes
+							 
+							 //Here its the service call
+							 
+							 ItemResponse itemresp = domainDataRetriever.getItemDetails(itemreq);
+							 
+							 //Here Starts with SAP-SIG inventory call
+							 
+							 //Add a iteminvdata to get wareHouse quantity
+							 
+							 //Here its service call
+							 
+						     ItemInventoryResponse iteminvresp = domainDataRetriever.getItemInventoryDetails(iteminvreq);
+							 
+							 //Add results into tmpMultiSkuLocResp
+							 
+							 //Get skuqty and setting into the wareHouse
+							 
+							 skuqty = getSkuqty(TmpSkuQtyLst, skuLst, itmInv.getSku()); determine skuqty to update
+							 
+            Step:3 -> populateMultiSkuLocResponseSAP ---> Its starts the process 
+
+                             //Here we are setting below fields to itemQuantityByProximitySvcResponse 
+							 
+							 setSkuCode
+							 setSkuLocationList
+							 setSkuDescription
+							 setQuantityInFulfillment
+							 setQuantityAvailable
+							 
+Step:5 -> sapLocations.size() !=0 then we processBAU(req, header);
+                             1. From request we are checking zipcode & city & state
+							 2. From Headers we are checking the clientOrderInfo
+							 3. process request for single item or multiple items 
+							    1. if (StringUtils.isNotBlank(req.getSkuCode()))
+								   processSkuLocRequest(req, address, clientOrderInfo,itemQuantityByProximitySvcResponse);
+								   //Here starts the process 
+								   SLDRetrieveStoreLocations ---> service to retrieve store location information
+								   //Here below are the service information
+								   1. if (StringUtils.isNotBlank(address.getZip()))
+								   storeLocations = (StoreLocationsResponse) storeServices.storeLocationByZip(address.getZip(), locSearchRange,
+								    D, 25, CacheOverride.PREFER_CACHED_VALUE);
+			                       
+								   2. else storeLocations = (StoreLocationsResponse) storeServices.storeLocationByCityState(address.getCity(),
+		                           address.getState(), locSearchRange, D, 25,CacheOverride.PREFER_CACHED_VALUE);
+								   
+							    2. else step 
+								   processMultiSkuLocRequest(req, address, clientOrderInfo,itemQuantityByProximitySvcResponse)
+								   
           
-		  
-		  now i need to start the 11 step can you please guide me the 11 step 
+		 
