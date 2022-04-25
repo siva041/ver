@@ -1,0 +1,657 @@
+MRX_ACE_TIM_SRVR
+
+Request Msg: MSG_TYPE_SKU_LOC_MULT_REQUEST
+Response Msg: MSG_TYPE_SKU_LOC_MULT_REPLY
+
+In the case of the current request message type ace_inv_sku_loc_mult function is invoked.
+ace_inv_sku_loc_mult Function: Initially sqlcode is updated as SQL$_SUCCESS.
+If sqlcode is successful then the below query is executed to get a short description.
+Table: INVENTORY.ITEM
+Input: sku, short_desc
+Output: sqlcode
+Query: ora_sql_get_short_desc
+If sqlcode is successful then a loop is iterated on SKU_LOC_MAX, locs value of sku_req and below query is executed.
+Table:  INVENTORY.ITEM_LOCATION
+Input: on_hand, allocated, pre_ord_alloc, pre_ord_threshold, pos_local_hold, pos_fulf_hold, locs, sku
+Output: sqlcode
+Query: ora_sql_get_itl_available_vals_scot
+If sqlcode is successful from above query(step no:4) then commit the transaction using ora_sql_dym_commit function else rollback using ora_sql_dym_rollback function.
+Also various fields of DYMAX_BLOCK request are updated and then dqc call is made to 'MRX_DYMREAD_SRVR' server with call param as 'DRS_CPARM_VALIDATE_ITEM'(CP-5).
+MRX_DYMREAD_SRVR: 
+Request Msg: ASSC_MSG_DYM_REQUEST
+Response Msg: ASSC_MSG_DYM_REPLY
+Call Param: DRS_CPARM_VALIDATE_ITEM (CP-5)
+In the rdb_drs_process_req_msg function in the case of current call param rdb_drs_ace_dym_req function is called.
+rdb_drs_ace_dym_req function: From this function based on current call param rdb_validate_dymax_item function is called.
+rdb_validate_dymax_item function: Makes a dqc call to 'MRX_DYMREAD_SRVR' with the call param as 'DRS_CPARM_RMT_ITEM'(CP 10).
+Now the below query is executed to get the records from DB.
+Table: INVENTORY.ITEM
+Input: itm_upc, itm_rec
+Output: sqlcode
+Query: ora_sql_get_item_by_upc
+Then a call is made to the get_item_records function.
+get_item_records Function: This function fetches the part information from ITEM table and if that was successful and the user is asking for the item location information it tries to fetch from the ITEM_LOCATION table.
+Initially execute the below query to get item related information from DB.
+Table: INVENTORT.ITEM
+Input: itm_part, itm_ptr
+Output: Sqlcode
+Query: ora_sql_get_item_by_part
+If the above query is successful and if the user is asking for the item location information then get the related info based on item part and location using below query.
+Table: INVENTORT.ITEM_LOCATION
+Input: itl_location, itl_part, itm_location_ptr
+Output: Sqlcode
+Query: ora_sql_get_item_loc
+If the ITL_BACKORD_ALLOC from above query is less than 0 then set it to 0.
+If enable_backord_avail and ITL_BACKORD_ALLOC is greater than 0 then Copy the value of tl_backord_alloc in itm_location_ptr to backord_alloc.
+(i.e., backord_alloc = itm_location_ptr->itl_backord_alloc). Otherwise, backord_alloc is set 0.
+Then the sum of itl_allocated and backord_alloc is assigned to iconic_alloc.
+(i.e., iconic_alloc = itm_location_ptr->itl_allocated + itm_location_ptr->itl_pre_ord_alloc + backord_alloc)
+If this sum (iconic_alloc) is greater than itl_on_hand .Set iconic_alloc to itl_on_hand.
+If the current location is 1000001, set otherloc to 1000040. Else if current location is 1000040, set otherloc to 1000001. Else set other location to blank.
+If the iconic_alloc is  less than itl_on_hand and otherloc starts with 1, then the below function is invoked.
+Table: INVENTORT.ITEM_LOCATION
+Input: location, part, ITM_LOCATION_REC
+Output: Sqlcode
+Query: ora_sql_get_item_other_loc
+If itl_backord_alloc from above query is less than 0, set it to 0.
+If enable_backord_avail and itl_backord_alloc is greater than 0. Copy the value from otherLoc.itl_backord_alloc to backord_alloc. (i.e., backord_alloc = otherLoc.itl_backord_alloc). Otherwise, backord_alloc is set 0.
+If sqlcode is 0, overAlloc is calculated as below:
+(overOther = (otherLoc.itl_allocated + otherLoc.itl_pre_ord_alloc + backord_alloc) - otherLoc.itl_on_hand)
+If overOther is greater than 0, set iconic_alloc to iconic_alloc +overOther.
+If iconic_alloc is greater than 0, set iconic_alloc to itl_on_hand of itm_location_ptr. Otherwise set iconic_alloc to 0.
+If the above dqc call is successful and dym_status is ‘RMS$_SUC’ then dep_quantity of sku_rsp is calculated as the difference between qty_on_hand and qty_allocated from dym_rsp_rec. Else dep_quantity of sku_rsp is updated as  ‘0’.
+Again dqc call is made to same 'MRX_DYMREAD_SRVR server with CP-5 (follow step no-7) 
+ Now If this dqc call is successful and dym_status is ‘RMS$_SUC’ then alt_dep_quantity of sku_mult_rsp is calculated as the difference between qty_on_hand and qty_allocated from dym_rsp_rec. Else alt_dep_quantity of sku_mult_rsp is updated as  ‘0’.
+ Then using the rdb_ainv_send_response function response is sent to the client.
+
+SQL Queries:
+
+
+void ora_sql_get_short_desc(int *sqlcode,
+                            char PART[20],
+                            char SHORT_DESC[20])
+{
+	EXEC SQL AT :posdb
+    SELECT NVL(ITM_SHORT_DESC, ' ')
+      INTO :SHORT_DESC
+	  FROM  ITEM
+	 WHERE ITM_PART= :PART;
+
+	*sqlcode = sqlca.sqlcode;
+
+	if(GTestFlag)
+		printf("\nora_sql_get_short_desc - ORA_SQL_CODE: %d \n",*sqlcode);
+
+}
+
+void ora_sql_get_itl_available_vals_scot(int *sqlcode,
+                                    int *ON_HAND,
+                                    int *ALLOCATED,
+                                    int *PRE_ORD_ALLOC,
+                                    int *PRE_ORD_THRESHOLD,
+                                    char *POS_LOCAL_HOLD,
+                                    char *POS_FULF_HOLD,
+                                    char LOCATION[7],
+                                    char PART[20])
+{
+
+	EXEC SQL AT :posdb       SELECT NVL(ITEM_LOC.ITL_ON_HAND, 0),
+             NVL(ITEM_LOC.ITL_ALLOCATED, 0),
+             NVL(ITEM_LOC.ITL_PRE_ORD_ALLOC, 0),
+             NVL(ITEM_LOC.ITL_PRE_ORD_THRESHOLD, 0),
+             NVL(ITEM_LOC.POS_LOCAL_HOLD, ' '),
+             NVL(ITEM_LOC.POS_FULF_HOLD, ' ')
+	INTO :ON_HAND, 
+             :*ALLOCATED, 
+             :*PRE_ORD_ALLOC, 
+             :*PRE_ORD_THRESHOLD,
+             :*POS_LOCAL_HOLD,
+             :*POS_FULF_HOLD 
+        FROM ITEM_LOCATION ITEM_LOC
+        WHERE ITEM_LOC.ITL_LOCATION = :LOCATION
+        AND   ITEM_LOC.ITL_PART     = :PART;
+
+	*sqlcode = sqlca.sqlcode;
+
+	if(GTestFlag) {
+		printf("\nora_sql_get_itl_available_vals - ORA_SQL_CODE: %d \n",*sqlcode);
+    }   
+
+}
+
+void ora_sql_get_item_by_upc(int *sqlcode,
+                             char UPC[12],
+                             struct item *ITM_REC)
+{
+	EXEC SQL AT :posdb
+    SELECT
+	    NVL(ITM_PART, ' '),
+	    NVL(ITM_CLASS1, ' '),
+	    NVL(ITM_CLASS2, ' '),
+	    NVL(ITM_CLASS3, ' '),
+	    NVL(ITM_CLASS4, ' '),
+	    NVL(ITM_CLASS5, ' '),
+	    NVL(ITM_TYPE, ' '),
+	    NVL(ITM_UNIT_MEASURE, ' '),
+	    NVL(ITM_PURCH_UM, ' '),
+	    NVL(ITM_MAKE_BUY, ' '),
+	    NVL(ITM_WEIGHT_UM, ' '),
+	    NVL(ITM_PACKAGE_SIZE, ' '),
+	    NVL(ITM_QTY_PER_PKG, 0),
+	    NVL(ITM_WEIGHT_CODE, ' '),
+	    NVL(ITM_WEIGHT, 0),
+	    NVL(ITM_DESCRIPTION, ' '),
+	    NVL(ITM_SHORT_DESC, ' '),
+	    NVL(ITM_SERIALIZED_CODE, ' '),
+	    NVL(ITM_UPC, ' '),
+	    NVL(ITM_VENDOR, ' '),
+	    NVL(ITM_DIST_WAREHOUSE, ' '),
+	    NVL(ITM_FORECAST_IND, ' '),
+	    NVL(ITM_COST_UM, ' '),
+	    NVL(ITM_NIFO_COST, 0) * 1000,
+	    NVL(ITM_LAST_COST, 0) * 1000,
+	    NVL(ITM_AVG_COST, 0) * 1000,
+	    NVL(ITM_FIFO_COST, 0) * 1000,
+	    NVL(ITM_MKT_COST, 0) * 1000,
+	    NVL(ITM_AUTO_COST_1, 0) * 1000,
+	    vms_timestamp(ITM_AUTO_COST_1_EFF_DATE),
+	    NVL(ITM_AUTO_COST_2, 0) * 1000,
+	    vms_timestamp(ITM_AUTO_COST_2_EFF_DATE),
+	    vms_timestamp(ITM_DATE_ADD),
+	    vms_timestamp(ITM_OBSOLETE_DATE),
+	    vms_timestamp(ITM_STAMP_DATE),
+	    NVL(ITM_PROGRAM_NAME, ' '),
+	    NVL(ITM_PROGRAM_PARA, ' '),
+	    NVL(ITM_PROGRAM_MODE, ' '),
+	    NVL(ITM_USER, ' '),
+	    NVL(ITM_USER_SLOCK, ' '),
+	    vms_timestamp(ITM_SLOCK_DATETIME),
+	    NVL(ITM_OBSOLETE_USER, ' '),
+	    NVL(ITM_OBSOLETE_REASON, ' '),
+	    NVL(ITM_DPC_GROUP, ' '),
+	    NVL(ITM_DPC_ITEM, ' '),
+	    NVL(ITM_DEVICE_TYPE, ' '),
+	    NVL(ITM_SKU_TIER, ' '),
+	    NVL(ITM_PREPAY_SKU, ' '),
+	    NVL(VIIA_SO_EXCEPT, ' '),
+	    NVL(EROES_EXCEPT, ' '),
+	    NVL(VIIA_TRF_EXCEPT, ' '),
+	    NVL(SLS_HOLD, ' '),
+           NVL(ITM_DEVICE_TYPE_1, ' '),
+	    NVL(ITM_UPC_FULL, ' ')
+#if ( ENTREL_125 & 0x03 ) != 0x03
+	  , NVL(ITM_BTA_ELIGIBLE,'Y')		-- NULL must map to space
+#endif
+	  , NVL(ITM_WAVE_ELIGIBLE,'N')
+	  , NVL(ITM_TRADE_IN_COST_1,0) * 1000
+	  , vms_timestamp(ITM_TRADE_IN_COST_1_DATE)
+          , NVL(ITM_DEVICE_CAP,0) * 100
+	INTO :ITM_REC->itm_part,
+        :ITM_REC->itm_class1,
+        :ITM_REC->itm_class2,
+        :ITM_REC->itm_class3,
+        :ITM_REC->itm_class4,
+        :ITM_REC->itm_class5,
+        :ITM_REC->itm_type,
+        :ITM_REC->itm_unit_measure,
+        :ITM_REC->itm_purch_um,
+        :ITM_REC->itm_make_buy,
+        :ITM_REC->itm_weight_um,
+        :ITM_REC->itm_package_size,
+        :ITM_REC->itm_qty_per_pkg,
+        :ITM_REC->itm_weight_code,
+        :ITM_REC->itm_weight,
+        :ITM_REC->itm_description,
+        :ITM_REC->itm_short_desc,
+        :ITM_REC->itm_serialized_code,
+        :ITM_REC->itm_upc,
+        :ITM_REC->itm_vendor,
+        :ITM_REC->itm_dist_warehouse,
+        :ITM_REC->itm_forecast_ind,
+        :ITM_REC->itm_cost_um,
+        :ITM_REC->itm_nifo_cost,
+        :ITM_REC->itm_last_cost,
+        :ITM_REC->itm_avg_cost,
+        :ITM_REC->itm_fifo_cost,
+        :ITM_REC->itm_mkt_cost,
+        :ITM_REC->itm_auto_cost_1,
+        :ITM_REC->itm_auto_cost_1_eff_date,
+        :ITM_REC->itm_auto_cost_2,
+        :ITM_REC->itm_auto_cost_2_eff_date,
+        :ITM_REC->itm_date_add,
+        :ITM_REC->itm_obsolete_date,
+        :ITM_REC->itm_stamp_date,
+        :ITM_REC->itm_program_name,
+        :ITM_REC->itm_program_para,
+        :ITM_REC->itm_program_mode,
+        :ITM_REC->itm_user,
+        :ITM_REC->itm_user_slock,
+        :ITM_REC->itm_slock_datetime,
+        :ITM_REC->itm_obsolete_user,
+        :ITM_REC->itm_obsolete_reason,
+        :ITM_REC->itm_dpc_group,
+        :ITM_REC->itm_dpc_item,
+        :ITM_REC->itm_device_type,
+        :ITM_REC->itm_sku_tier,
+        :ITM_REC->itm_prepay_sku,
+        :ITM_REC->viia_so_except,
+        :ITM_REC->eroes_except,
+        :ITM_REC->viia_trf_except,
+        :ITM_REC->sls_hold,
+        :ITM_REC->itm_device_type_1
+      , :ITM_REC->itm_upc_full
+#if ( ENTREL_125 & 0x03 ) != 0x03
+      , :ITM_REC->itm_bta_eligible
+#endif
+      , :ITM_REC->itm_wave_eligible
+      , :ITM_REC->itm_trade_in_cost_1
+      , :ITM_REC->itm_trade_in_cost_1_date
+      , :ITM_REC->itm_device_cap
+    FROM ITEM ITEM
+   WHERE ITEM.ITM_UPC = :UPC;
+
+	*sqlcode = sqlca.sqlcode;
+
+	if(GTestFlag)
+		printf("\nora_sql_get_item_by_upc - ORA_SQL_CODE: %d \n",*sqlcode);
+
+#if ( ENTREL_125 & 0x03 ) == 0x03
+	  bta_temporary_set( ITM_REC->itm_part,
+	  		sizeof ITM_REC->itm_part,
+			&ITM_REC->itm_bta_eligible );
+#endif
+}
+
+void ora_sql_get_item_by_part(int *sqlcode, char PART[20], struct item *ITM_REC)
+{
+	EXEC SQL AT :posdb SELECT
+	    NVL(ITM_PART, ' '),
+	    NVL(ITM_CLASS1, ' '),
+	    NVL(ITM_CLASS2, ' '),
+	    NVL(ITM_CLASS3, ' '),
+	    NVL(ITM_CLASS4, ' '),
+	    NVL(ITM_CLASS5, ' '),
+	    NVL(ITM_TYPE, ' '),
+	    NVL(ITM_UNIT_MEASURE, ' '),
+	    NVL(ITM_PURCH_UM, ' '),
+	    NVL(ITM_MAKE_BUY, ' '),
+	    NVL(ITM_WEIGHT_UM, ' '),
+	    NVL(ITM_PACKAGE_SIZE, ' '),
+	    NVL(ITM_QTY_PER_PKG, 0),
+	    NVL(ITM_WEIGHT_CODE, ' '),
+	    NVL(ITM_WEIGHT, 0) * 10000,
+	    NVL(ITM_DESCRIPTION, ' '),
+	    NVL(ITM_SHORT_DESC, ' '),
+	    NVL(ITM_SERIALIZED_CODE, ' '),
+	    NVL(ITM_UPC, ' '),
+	    NVL(ITM_VENDOR, ' '),
+	    NVL(ITM_DIST_WAREHOUSE, ' '),
+	    NVL(ITM_FORECAST_IND, ' '),
+	    NVL(ITM_COST_UM, ' '),
+	    NVL(ITM_NIFO_COST, 0) * 1000,
+	    NVL(ITM_LAST_COST, 0) * 1000,
+	    NVL(ITM_AVG_COST, 0) * 1000,
+	    NVL(ITM_FIFO_COST, 0) * 1000,
+	    NVL(ITM_MKT_COST, 0) * 1000,
+	    NVL(ITM_AUTO_COST_1, 0) * 1000,
+	    vms_timestamp(ITM_AUTO_COST_1_EFF_DATE),
+	    NVL(ITM_AUTO_COST_2, 0) * 1000,
+	    vms_timestamp(ITM_AUTO_COST_2_EFF_DATE),
+	    vms_timestamp(ITM_DATE_ADD),
+	    vms_timestamp(ITM_OBSOLETE_DATE),
+	    vms_timestamp(ITM_STAMP_DATE),
+	    NVL(ITM_PROGRAM_NAME, ' '),
+	    NVL(ITM_PROGRAM_PARA, ' '),
+	    NVL(ITM_PROGRAM_MODE, ' '),
+	    NVL(ITM_USER, ' '),
+	    NVL(ITM_USER_SLOCK, ' '),
+	    vms_timestamp(ITM_SLOCK_DATETIME),
+	    NVL(ITM_OBSOLETE_USER, ' '),
+	    NVL(ITM_OBSOLETE_REASON, ' '),
+	    NVL(ITM_DPC_GROUP, ' '),
+	    NVL(ITM_DPC_ITEM, ' '),
+	    NVL(ITM_DEVICE_TYPE, ' '),
+	    NVL(ITM_SKU_TIER, ' '),
+	    NVL(ITM_PREPAY_SKU, ' '),
+	    NVL(VIIA_SO_EXCEPT, ' '),
+	    NVL(EROES_EXCEPT, ' '),
+	    NVL(VIIA_TRF_EXCEPT, ' '),
+	    NVL(SLS_HOLD, ' '),
+        NVL(ITM_DEVICE_TYPE_1, ' ')
+#if ( ENTREL_125 & 0x03 ) != 0x03
+	  , NVL(ITM_BTA_ELIGIBLE,' ')	-- NULL must map to space
+#endif
+	  , NVL(ITM_WAVE_ELIGIBLE,'N')
+	  , NVL(ITM_TRADE_IN_COST_1,0) * 1000
+	  , vms_timestamp(ITM_TRADE_IN_COST_1_DATE)
+         , NVL(ITM_DEVICE_CAP,0) * 100
+	  , NVL(ITM_UPC_FULL, ' ')
+	INTO :ITM_REC->itm_part,
+        :ITM_REC->itm_class1,
+        :ITM_REC->itm_class2,
+        :ITM_REC->itm_class3,
+        :ITM_REC->itm_class4,
+        :ITM_REC->itm_class5,
+        :ITM_REC->itm_type,
+        :ITM_REC->itm_unit_measure,
+        :ITM_REC->itm_purch_um,
+        :ITM_REC->itm_make_buy,
+        :ITM_REC->itm_weight_um,
+        :ITM_REC->itm_package_size,
+        :ITM_REC->itm_qty_per_pkg,
+        :ITM_REC->itm_weight_code,
+        :ITM_REC->itm_weight,
+        :ITM_REC->itm_description,
+        :ITM_REC->itm_short_desc,
+        :ITM_REC->itm_serialized_code,
+        :ITM_REC->itm_upc,
+        :ITM_REC->itm_vendor,
+        :ITM_REC->itm_dist_warehouse,
+        :ITM_REC->itm_forecast_ind,
+        :ITM_REC->itm_cost_um,
+        :ITM_REC->itm_nifo_cost,
+        :ITM_REC->itm_last_cost,
+        :ITM_REC->itm_avg_cost,
+        :ITM_REC->itm_fifo_cost,
+        :ITM_REC->itm_mkt_cost,
+        :ITM_REC->itm_auto_cost_1,
+        :ITM_REC->itm_auto_cost_1_eff_date,
+        :ITM_REC->itm_auto_cost_2,
+        :ITM_REC->itm_auto_cost_2_eff_date,
+        :ITM_REC->itm_date_add,
+        :ITM_REC->itm_obsolete_date,
+        :ITM_REC->itm_stamp_date,
+        :ITM_REC->itm_program_name,
+        :ITM_REC->itm_program_para,
+        :ITM_REC->itm_program_mode,
+        :ITM_REC->itm_user,
+        :ITM_REC->itm_user_slock,
+        :ITM_REC->itm_slock_datetime,
+        :ITM_REC->itm_obsolete_user,
+        :ITM_REC->itm_obsolete_reason,
+        :ITM_REC->itm_dpc_group,
+        :ITM_REC->itm_dpc_item,
+        :ITM_REC->itm_device_type,
+        :ITM_REC->itm_sku_tier,
+        :ITM_REC->itm_prepay_sku,
+        :ITM_REC->viia_so_except,
+        :ITM_REC->eroes_except,
+        :ITM_REC->viia_trf_except,
+        :ITM_REC->sls_hold,
+        :ITM_REC->itm_device_type_1
+#if ( ENTREL_125 & 0x03 ) != 0x03
+      , :ITM_REC->itm_bta_eligible
+#endif
+      , :ITM_REC->itm_wave_eligible
+      , :ITM_REC->itm_trade_in_cost_1
+      , :ITM_REC->itm_trade_in_cost_1_date
+      , :ITM_REC->itm_device_cap
+      , :ITM_REC->itm_upc_full
+    FROM ITEM 
+        WHERE ITM_PART = :PART;
+
+    //printf("part:%s:\n",ORA_item_rec.itm_part);
+
+	*sqlcode = sqlca.sqlcode;
+
+#if ( ENTREL_125 & 0x03 ) == 0x03
+	  bta_temporary_set( ITM_REC->itm_part,
+	  		sizeof ITM_REC->itm_part,
+			&ITM_REC->itm_bta_eligible );
+#endif
+
+	if(GTestFlag)
+	{
+	    printf("\nora_sql_get_item_by_part - ORA_SQL_CODE: %d \n",*sqlcode);
+	    if ( *sqlcode == 1403 )
+	        printf( "ora_sql_get_item_by_part /%.*s/ part=/%.*s/\n",
+				FCHARLEN(posdb), FCHARLEN(ITM_REC->itm_part) );
+	}
+}
+
+
+void ora_sql_get_item_loc(int *sqlcode,
+                          char LOCATION[7],
+                          char PART[20],
+                          struct item_location *ITM_LOCATION_REC)
+{
+	EXEC SQL AT :posdb SELECT
+		NVL(ITEM_LOC.ITL_PART, ' '),
+		NVL(ITEM_LOC.ITL_LOCATION, ' '),
+		NVL(ITEM_LOC.ITL_ON_HAND, 0),
+		NVL(ITEM_LOC.ITL_ON_ORDER, 0),
+		NVL(ITEM_LOC.ITL_ON_BACKORD, 0),
+		NVL(ITEM_LOC.ITL_ALLOCATED, 0),
+		NVL(ITEM_LOC.ITL_UNALLOCATED, 0),
+		NVL(ITEM_LOC.ITL_BACKORD_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_PRICE_LEVELS, 0),
+		NVL(ITEM_LOC.ITL_SALES_PRICE_1, 0) * 100,
+		NVL(ITEM_LOC.ITL_SALES_UM_1, ' '),
+		NVL(ITEM_LOC.ITL_PRICE_NAR_1, ' '),
+		NVL(ITEM_LOC.ITL_SALES_PRICE_2, 0) * 100,
+		NVL(ITEM_LOC.ITL_SALES_UM_2, ' '),
+		NVL(ITEM_LOC.ITL_PRICE_NAR_2, ' '),
+		NVL(ITEM_LOC.ITL_SALES_PRICE_3, 0) * 100,
+		NVL(ITEM_LOC.ITL_SALES_UM_3, ' '),
+		NVL(ITEM_LOC.ITL_PRICE_NAR_3, ' '),
+		NVL(ITEM_LOC.ITL_SALES_PRICE_4, 0) * 100,
+		NVL(ITEM_LOC.ITL_SALES_UM_4, ' '),
+		NVL(ITEM_LOC.ITL_PRICE_NAR_4, ' '),
+		NVL(ITEM_LOC.ITL_SALES_PRICE_5, 0) * 100,
+		NVL(ITEM_LOC.ITL_SALES_UM_5, ' '),
+		NVL(ITEM_LOC.ITL_PRICE_NAR_5, ' '),
+		NVL(ITEM_LOC.ITL_SALES_PRICE_6, 0) * 100,
+		NVL(ITEM_LOC.ITL_SALES_UM_6, ' '),
+		NVL(ITEM_LOC.ITL_PRICE_NAR_6, ' '),
+		NVL(ITEM_LOC.ITL_COMPET_PRICE_UM, ' '),
+		NVL(ITEM_LOC.ITL_COMPET_PRICE, 0) * 100,
+		NVL(ITEM_LOC.ITL_TRF_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_OUT_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_NEW_DOA, 0),
+		NVL(ITEM_LOC.ITL_SAL_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_SAL_BACKORD, 0),
+		NVL(ITEM_LOC.ITL_USED_ON_HAND, 0),
+		NVL(ITEM_LOC.ITL_USED_ALLOCATED, 0),
+		NVL(ITEM_LOC.ITL_USED_ON_ORDER, 0),
+		NVL(ITEM_LOC.ITL_USED_BACKORD_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_DEMO_ON_HAND, 0),
+		NVL(ITEM_LOC.ITL_DEMO_ON_ORDER, 0),
+		NVL(ITEM_LOC.ITL_PEND_ON_HAND, 0),
+		vms_timestamp(ITEM_LOC.ITL_LAST_SALE_DATE),
+		vms_timestamp(ITEM_LOC.ITL_LAST_PURCHASE_DATE),
+		vms_timestamp(ITEM_LOC.ITL_LAST_PRICE_INCREASE),
+		NVL(ITEM_LOC.ITL_BANM_FED_TAX, ' '),
+		NVL(ITEM_LOC.ITL_BANM_STATE_TAX, ' '),
+		NVL(ITEM_LOC.ITL_BANM_COUNTY_TAX, ' '),
+		NVL(ITEM_LOC.ITL_BANM_CITY_TAX, ' '),
+		NVL(ITEM_LOC.ITL_BANM_LOCAL_TAX, ' '),
+		NVL(ITEM_LOC.ITL_FORECAST_ITEM, ' '),
+		NVL(ITEM_LOC.ITL_TAXABLE, ' '),
+		NVL(ITEM_LOC.ITL_ORDER_POLICY, ' '),
+		NVL(ITEM_LOC.ITL_BACKORDER_PERMIT, ' '),
+		NVL(ITEM_LOC.ITL_MTHS_SUPPLY, 0),
+		NVL(ITEM_LOC.ITL_ETA_QTY, 0),
+		NVL(ITEM_LOC.ITL_ETA_VENDOR, ' '),
+		NVL(ITEM_LOC.ITL_REPLENISH_WEEKS, 0),
+		NVL(ITEM_LOC.ITL_REPLENISH_YN, ' '),
+		NVL(ITEM_LOC.ITL_WATCH_ITEM, ' '),
+		NVL(ITEM_LOC.ITL_HOLD_ALLOC_YN, ' '),
+		vms_timestamp(ITEM_LOC.ITL_STAMP_DATE),
+		NVL(ITEM_LOC.ITL_PROGRAM_NAME, ' '),
+		NVL(ITEM_LOC.ITL_PROGRAM_PARA, ' '),
+		NVL(ITEM_LOC.ITL_PROGRAM_MODE, ' '),
+		NVL(ITEM_LOC.ITL_USER, ' '),
+		NVL(ITEM_LOC.ITL_USER_SLOCK, ' '),
+		vms_timestamp(ITEM_LOC.ITL_SLOCK_DATETIME),
+		NVL(ITEM_LOC.ITL_NEW_PT_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_USED_PT_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_PEND_PT_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_DEMO_PT_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_DOA_PT_ALLOC, 0),
+		vms_timestamp(ITEM_LOC.ITL_HOLD_DATE),
+		NVL(ITEM_LOC.ITL_HOLD_USER, ' '),
+		NVL(ITEM_LOC.ITL_HOLD_REASON, ' '),
+		NVL(ITEM_LOC.ITL_PRE_ORD_ALLOC, 0),
+	        NVL(ITEM_LOC.ITL_PRE_ORD_THRESHOLD, 0),
+		NVL(ITEM_LOC.POS_EXCEPT, ' '),
+		NVL(ITEM_LOC.VIIA_REPL_HOLD, ' '),
+		NVL(ITEM_LOC.VIIA_STST_HOLD, ' '),
+		NVL(ITEM_LOC.VIIA_CRW_HOLD, ' '),
+		NVL(ITEM_LOC.POS_LOCAL_HOLD, ' '),
+		NVL(ITEM_LOC.POS_FULF_HOLD, ' ')
+	INTO 
+           -- :ITM_LOCATION_REC
+           :ITM_LOCATION_REC->itl_part,
+           :ITM_LOCATION_REC->itl_location,
+           :ITM_LOCATION_REC->itl_on_hand,
+           :ITM_LOCATION_REC->itl_on_order,
+           :ITM_LOCATION_REC->itl_on_backord,
+           :ITM_LOCATION_REC->itl_allocated,
+           :ITM_LOCATION_REC->itl_unallocated,
+           :ITM_LOCATION_REC->itl_backord_alloc,
+           :ITM_LOCATION_REC->itl_price_levels,
+           :ITM_LOCATION_REC->itl_sales_price_1,
+           :ITM_LOCATION_REC->itl_sales_um_1,
+           :ITM_LOCATION_REC->itl_price_nar_1,
+           :ITM_LOCATION_REC->itl_sales_price_2,
+           :ITM_LOCATION_REC->itl_sales_um_2,
+           :ITM_LOCATION_REC->itl_price_nar_2,
+           :ITM_LOCATION_REC->itl_sales_price_3,
+           :ITM_LOCATION_REC->itl_sales_um_3,
+           :ITM_LOCATION_REC->itl_price_nar_3,
+           :ITM_LOCATION_REC->itl_sales_price_4,
+           :ITM_LOCATION_REC->itl_sales_um_4,
+           :ITM_LOCATION_REC->itl_price_nar_4,
+           :ITM_LOCATION_REC->itl_sales_price_5,
+           :ITM_LOCATION_REC->itl_sales_um_5,
+           :ITM_LOCATION_REC->itl_price_nar_5,
+           :ITM_LOCATION_REC->itl_sales_price_6,
+           :ITM_LOCATION_REC->itl_sales_um_6,
+           :ITM_LOCATION_REC->itl_price_nar_6,
+           :ITM_LOCATION_REC->itl_compet_price_um,
+           :ITM_LOCATION_REC->itl_compet_price,
+           :ITM_LOCATION_REC->itl_trf_alloc,
+           :ITM_LOCATION_REC->itl_out_alloc,
+           :ITM_LOCATION_REC->itl_new_doa,
+           :ITM_LOCATION_REC->itl_sal_alloc,
+           :ITM_LOCATION_REC->itl_sal_backord,
+           :ITM_LOCATION_REC->itl_used_on_hand,
+           :ITM_LOCATION_REC->itl_used_allocated,
+           :ITM_LOCATION_REC->itl_used_on_order,
+           :ITM_LOCATION_REC->itl_used_backord_alloc,
+           :ITM_LOCATION_REC->itl_demo_on_hand,
+           :ITM_LOCATION_REC->itl_demo_on_order,
+           :ITM_LOCATION_REC->itl_pend_on_hand,
+           :ITM_LOCATION_REC->itl_last_sale_date,
+           :ITM_LOCATION_REC->itl_last_purchase_date,
+           :ITM_LOCATION_REC->itl_last_price_increase,
+           :ITM_LOCATION_REC->itl_banm_fed_tax,
+           :ITM_LOCATION_REC->itl_banm_state_tax,
+           :ITM_LOCATION_REC->itl_banm_county_tax,
+           :ITM_LOCATION_REC->itl_banm_city_tax,
+           :ITM_LOCATION_REC->itl_banm_local_tax,
+           :ITM_LOCATION_REC->itl_forecast_item,
+           :ITM_LOCATION_REC->itl_taxable,
+           :ITM_LOCATION_REC->itl_order_policy,
+           :ITM_LOCATION_REC->itl_backorder_permit,
+           :ITM_LOCATION_REC->itl_mths_supply,
+           :ITM_LOCATION_REC->itl_eta_qty,
+           :ITM_LOCATION_REC->itl_eta_vendor,
+           :ITM_LOCATION_REC->itl_replenish_weeks,
+           :ITM_LOCATION_REC->itl_replenish_yn,
+           :ITM_LOCATION_REC->itl_watch_item,
+           :ITM_LOCATION_REC->itl_hold_alloc_yn,
+           :ITM_LOCATION_REC->itl_stamp_date,
+           :ITM_LOCATION_REC->itl_program_name,
+           :ITM_LOCATION_REC->itl_program_para,
+           :ITM_LOCATION_REC->itl_program_mode,
+           :ITM_LOCATION_REC->itl_user,
+           :ITM_LOCATION_REC->itl_user_slock,
+           :ITM_LOCATION_REC->itl_slock_datetime,
+           :ITM_LOCATION_REC->itl_new_pt_alloc,
+           :ITM_LOCATION_REC->itl_used_pt_alloc,
+           :ITM_LOCATION_REC->itl_pend_pt_alloc,
+           :ITM_LOCATION_REC->itl_demo_pt_alloc,
+           :ITM_LOCATION_REC->itl_doa_pt_alloc,
+           :ITM_LOCATION_REC->itl_hold_date,
+           :ITM_LOCATION_REC->itl_hold_user,
+           :ITM_LOCATION_REC->itl_hold_reason,
+           :ITM_LOCATION_REC->itl_pre_ord_alloc,
+           :ITM_LOCATION_REC->itl_pre_ord_threshold,
+           :ITM_LOCATION_REC->pos_except,
+           :ITM_LOCATION_REC->viia_repl_hold,
+           :ITM_LOCATION_REC->viia_stst_hold,
+           :ITM_LOCATION_REC->viia_crw_hold,
+           :ITM_LOCATION_REC->pos_local_hold,
+           :ITM_LOCATION_REC->pos_fulf_hold
+        FROM 
+           ITEM_LOCATION ITEM_LOC
+        WHERE 
+           ITEM_LOC.ITL_LOCATION = :LOCATION
+           AND ITEM_LOC.ITL_PART = :PART
+       ;
+
+	*sqlcode = sqlca.sqlcode;
+
+	if(GTestFlag)
+    {
+		printf("\nora_sql_get_item_loc - ORA_SQL_CODE: %d \n",*sqlcode);
+        //PRINT_ITEM_LOCATION(ITM_LOCATION_REC);
+    }
+}
+
+void	ora_sql_dym_commit(int *sqlcode)
+{
+    EXEC SQL AT :posdb COMMIT;
+
+	*sqlcode = sqlca.sqlcode;
+
+
+	if(GTestFlag)
+		printf("\nora_sql_dym_commit - ORA_SQL_CODE: %d \n",*sqlcode);
+}
+
+void ora_sql_dym_rollback(int *sqlcode)
+{
+
+    EXEC SQL AT :posdb  ROLLBACK;
+    *sqlcode = sqlca.sqlcode;
+    if(sqlca.sqlcode != 0)
+        printf("\nora_sql_dym_rollback - ORA_SQL_CODE: %d \n",*sqlcode);
+	if(GTestFlag)
+		printf("\nora_sql_dym_rollback - ORA_SQL_CODE: %d \n",*sqlcode);
+
+}
+
+void ora_sql_get_item_other_loc(int *sqlcode,
+                          char LOCATION[7],
+                          char PART[20],
+                          struct item_location *ITM_LOCATION_REC)
+{
+	EXEC SQL AT :posdb SELECT
+		NVL(ITEM_LOC.ITL_ON_HAND, 0),
+		NVL(ITEM_LOC.ITL_ALLOCATED, 0),
+		NVL(ITEM_LOC.ITL_BACKORD_ALLOC, 0),
+		NVL(ITEM_LOC.ITL_PRE_ORD_ALLOC, 0)
+	INTO 
+           :ITM_LOCATION_REC->itl_on_hand,
+           :ITM_LOCATION_REC->itl_allocated,
+           :ITM_LOCATION_REC->itl_backord_alloc,
+           :ITM_LOCATION_REC->itl_pre_ord_alloc
+        FROM 
+           ITEM_LOCATION ITEM_LOC
+        WHERE 
+           ITEM_LOC.ITL_LOCATION = :LOCATION
+           AND ITEM_LOC.ITL_PART = :PART
+       ;
+
+	*sqlcode = sqlca.sqlcode;
+
+	if(GTestFlag)
+    {
+		printf("\nora_sql_get_item_loc - ORA_SQL_CODE: %d \n",*sqlcode);
+        //PRINT_ITEM_LOCATION(ITM_LOCATION_REC);
+    }
+}
+
+
